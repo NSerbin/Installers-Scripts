@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+readonly AWSCLI_PATH="/usr/local/bin/aws"
 readonly EKSCTL_PATH="/usr/local/bin/eksctl"
 readonly HELM_PATH="/usr/local/bin/helm"
 readonly TERRAFORM_DOCS_PATH="/usr/local/bin/terraform-docs"
@@ -16,13 +17,16 @@ function is_installed() {
   if [[ -f "$tool_path" ]]; then
     echo "======================================="
     echo "$tool_name is already installed at $(command -v "$tool_name")"
-    if [[ "$tool_name" == "terragrunt" ]]; then
-      echo "Version: $($tool_name -version 2>/dev/null | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+')"
-    elif [[ "$tool_name" == "helm" ]]; then
-      echo "Version: $($tool_name version --short | awk '{print $1}' | sed 's/+.*//')"
-    else
-      echo "Version: $($tool_name version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+')"
-    fi
+    
+    local version_cmd
+    case "$tool_name" in
+      aws) version_cmd="$tool_name --version | awk '{print \$1}' | cut -d'/' -f2" ;;
+      terragrunt) version_cmd="$tool_name -version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/v//'" ;;
+      helm) version_cmd="$tool_name version --short | awk '{print \$1}' | sed 's/+.*//' | sed 's/v//'" ;;
+      *) version_cmd="$tool_name version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/v//'" ;;
+    esac
+    
+    echo "Version: $(eval $version_cmd)"
     return 0
   else
     return 1
@@ -37,47 +41,44 @@ function download_and_install() {
   local file_extension="$5"
   
   local version
-  version=$(curl -sL "${latest_version_url}" | jq -r '.tag_name')
-
-  local url
-  if [[ "$tool_name" == "terraform-docs" ]]; then
-    url="https://github.com/terraform-docs/terraform-docs/releases/download/${version}/terraform-docs-${version}-${os_type}.${file_extension}"
-  elif [[ "$tool_name" == "terraform" ]]; then
-    url="https://releases.hashicorp.com/terraform/${version}/terraform_${version#v}_${os_type}.${file_extension}"
-  elif [[ "$tool_name" == "terragrunt" ]]; then
-    url="https://github.com/gruntwork-io/terragrunt/releases/download/${version}/terragrunt_${os_type}"
-  elif [[ "$tool_name" == "helm" ]]; then
-    url="https://get.helm.sh/helm-${version}-${os_type}.${file_extension}"
-  elif [[ "$tool_name" == "eksctl" ]]; then
-    url="https://github.com/weaveworks/eksctl/releases/download/${version}/eksctl_${os_type}.${file_extension}"
-  fi
-
-  wget "${url}"
-  if [[ "${file_extension}" == "tar.gz" ]]; then
-    if [[ "$tool_name" == "terraform-docs" ]]; then
-      tar -xzf "terraform-docs-${version}-${os_type}.${file_extension}"
-      sudo mv "terraform-docs" "${tool_path}"
-    elif [[ "$tool_name" == "helm" ]]; then
-      tar -xzf "${tool_name}-${version}-${os_type}.${file_extension}"
-      sudo mv "${os_type}/helm" "${tool_path}"
-    elif [[ "$tool_name" == "eksctl" ]]; then
-      tar -xzf "${tool_name}_${os_type}.${file_extension}"
-      sudo mv "eksctl" "${tool_path}"
-    fi
-  elif [[ "${file_extension}" == "zip" ]]; then
-    unzip "${tool_name}-${version}-${os_type}.${file_extension}"
-    sudo mv "${tool_name}-${version}-${os_type}/${tool_name}" "${tool_path}"
+  if [[ "$tool_name" == "terraform" ]]; then
+    version=$(curl -sL "${latest_version_url}" | grep tag_name | cut -d: -f2 | tr -d \"\,\v | awk '{$1=$1};1')
   else
-    mv "terragrunt_${os_type}" "${tool_path}"
+    version=$(curl -sL "${latest_version_url}" | jq -r '.tag_name')
   fi
+
+  local url_template
+  case "$tool_name" in
+    terraform-docs) url_template="https://github.com/terraform-docs/terraform-docs/releases/download/${version}/terraform-docs-${version}-${os_type}.${file_extension}" ;;
+    terraform) url_template="https://releases.hashicorp.com/terraform/${version}/terraform_${version}_${os_type}.${file_extension}" ;;
+    terragrunt) url_template="https://github.com/gruntwork-io/terragrunt/releases/download/${version}/terragrunt_${os_type}" ;;
+    helm) url_template="https://get.helm.sh/helm-${version}-${os_type}.${file_extension}" ;;
+    eksctl) url_template="https://github.com/weaveworks/eksctl/releases/download/${version}/eksctl_${os_type}.${file_extension}" ;;
+    aws) url_template="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;;
+  esac
   
-  chmod +x "${tool_path}"
+  wget "${url_template}" -O "${tool_name}.${file_extension}"
+  
+  case "${file_extension}" in
+    tar.gz) tar -xzf "${tool_name}.${file_extension}" ;;
+    zip) unzip "${tool_name}.${file_extension}" ;;
+    "") mv "${tool_name}.${file_extension}" "${tool_name}" ;;
+  esac
 
-  if [[ "$tool_name" == "terragrunt" ]]; then
-    echo "Installed: $(${tool_name} -version)"
+  if [[ "$file_extension" == "" ]]; then
+    sudo mv "${tool_name}" "${tool_path}"
   else
-    echo "Installed: $(${tool_name} version)"
+    sudo mv $(find . -name "${tool_name}") "${tool_path}"
   fi
+
+  chmod +x "${tool_path}"
+  
+  case "$tool_name" in
+    terragrunt) echo "Installed: $(${tool_name} -version)" ;;
+    *) echo "Installed: $(${tool_name} version)" ;;
+  esac
+
+  rm -f "${tool_name}.${file_extension}"
 }
 
 function install_tool() {
@@ -88,17 +89,14 @@ function install_tool() {
   local file_extension="$5"
   
   if is_installed "${tool_path}" "${tool_name}"; then
-    local current_version
-    local latest_version
-
-    if [[ "$tool_name" == "terragrunt" ]]; then
-      current_version=$("${tool_name}" -version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/v//')
-    elif [[ "$tool_name" == "helm" ]]; then
-      current_version=$("${tool_name}" version --short | awk '{print $1}' | sed 's/+.*//' | sed 's/v//')
-    else
-      current_version=$("${tool_name}" version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/v//')
-    fi
-
+    local current_version latest_version
+    
+    case "$tool_name" in
+      terragrunt) current_version=$("${tool_name}" -version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/v//') ;;
+      helm) current_version=$("${tool_name}" version --short | awk '{print $1}' | sed 's/+.*//' | sed 's/v//') ;;
+      *) current_version=$("${tool_name}" version | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/v//') ;;
+    esac
+    
     latest_version=$(curl -sL "${latest_version_url}" | jq -r '.tag_name' | sed 's/v//')
 
     if [[ $(printf '%s\n' "$latest_version" "$current_version" | sort -V | head -n1) != "$latest_version" ]]; then
@@ -108,7 +106,6 @@ function install_tool() {
       download_and_install "${tool_name}" "${latest_version_url}" "${tool_path}" "${os_type}" "${file_extension}"
     else
       echo "${tool_name} is up to date."
-      return 0
     fi
   else
     echo "${tool_name} is not installed. Installing..."
@@ -118,18 +115,16 @@ function install_tool() {
 
 case $OS_SYSTEM in
   "Linux")
-    TERRAFORM_DOCS_OS_TYPE="linux-amd64"
-    TERRAFORM_OS_TYPE="linux_amd64"
-    TERRAGRUNT_OS_TYPE="linux_amd64"
-    HELM_OS_TYPE="linux-amd64"
-    EKSCTL_OS_TYPE="linux_amd64"
+    os_type="linux-amd64"
+    terraform_os_type="linux_amd64"
+    terragrunt_os_type="linux_amd64"
+    eksctl_os_type="linux_amd64"
     ;;
   "Darwin")
-    TERRAFORM_DOCS_OS_TYPE="darwin-amd64"
-    TERRAFORM_OS_TYPE="darwin_amd64"
-    TERRAGRUNT_OS_TYPE="darwin_amd64"
-    HELM_OS_TYPE="darwin-amd64"
-    EKSCTL_OS_TYPE="darwin_amd64"    
+    os_type="darwin-amd64"
+    terraform_os_type="darwin_amd64"
+    terragrunt_os_type="darwin_amd64"
+    eksctl_os_type="darwin_amd64"
     ;;
   *)
     echo "OS not supported"
@@ -137,8 +132,8 @@ case $OS_SYSTEM in
     ;;
 esac
 
-install_tool "terraform-docs" "https://api.github.com/repos/terraform-docs/terraform-docs/releases/latest" "${TERRAFORM_DOCS_PATH}" "${TERRAFORM_DOCS_OS_TYPE}" "tar.gz"
-install_tool "terraform" "https://api.github.com/repos/hashicorp/terraform/releases/latest" "${TERRAFORM_PATH}" "${TERRAFORM_OS_TYPE}" "zip"
-install_tool "terragrunt" "https://api.github.com/repos/gruntwork-io/terragrunt/releases/latest" "${TERRAGRUNT_PATH}" "${TERRAGRUNT_OS_TYPE}" ""
-install_tool "helm" "https://api.github.com/repos/helm/helm/releases/latest" "${HELM_PATH}" "${HELM_OS_TYPE}" "tar.gz"
-install_tool "eksctl" "https://api.github.com/repos/weaveworks/eksctl/releases/latest" "${EKSCTL_PATH}" "${EKSCTL_OS_TYPE}" "tar.gz"
+install_tool "terraform-docs" "https://api.github.com/repos/terraform-docs/terraform-docs/releases/latest" "${TERRAFORM_DOCS_PATH}" "${os_type}" "tar.gz"
+install_tool "terraform" "https://api.github.com/repos/hashicorp/terraform/releases/latest" "${TERRAFORM_PATH}" "${terraform_os_type}" "zip"
+install_tool "terragrunt" "https://api.github.com/repos/gruntwork-io/terragrunt/releases/latest" "${TERRAGRUNT_PATH}" "${terragrunt_os_type}" ""
+install_tool "helm" "https://api.github.com/repos/helm/helm/releases/latest" "${HELM_PATH}" "${os_type}" "tar.gz"
+install_tool "eksctl" "https://api.github.com/repos/weaveworks/eksctl/releases/latest" "${EKSCTL_PATH}" "${eksctl_os_type}" "tar.gz"
